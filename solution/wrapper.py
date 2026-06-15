@@ -60,21 +60,38 @@ _INJECTION_SIGNAL = re.compile(
     r"system|overrid|instruct|set\s+price|new\s+price)",
     re.IGNORECASE,
 )
+# A trailing "contact me" clause (PII noise) -- a contact keyword followed by an
+# email or phone number to end of line. Removing it gives the agent a clean order
+# (some models otherwise loop on the extra digits) and keeps PII out of the model.
+_CONTACT_CLAUSE = re.compile(
+    r"[\s,.;:!?-]+"                              # require a separator before the clause
+    r"(?:g[oọ]i|li[eê]n\s*h[eệ]|lh|nh[aắ]n\s*tin|inbox|zalo|"
+    r"e-?mail|s[dđ]t|s[oố]\s*[dđ]i[eệ]n\s*tho[aạ]i|[dđ]i[eệ]n\s*tho[aạ]i)"
+    r"\b[^\n]*?"                                 # whole-word keyword, then lazily up to the PII
+    r"(?:[\w.+-]+@[\w-]+\.[\w.-]+|(?:\+?84|0)\d{8,10})"   # an email or VN phone number
+    r"[^\n]*$",                                  # ...to end of line (trailing clause only)
+    re.IGNORECASE,
+)
 
 
 def sanitize_question(question):
-    """Return (clean_question, removed_note_text|None). Strips an injected directive that
-    follows a note marker; leaves a benign note untouched."""
+    """Return (clean_question, what_was_stripped|None). Removes trailing contact PII and
+    neutralizes injected directives inside an order note; leaves a benign question untouched."""
     if not isinstance(question, str):
         return question, None
-    m = _NOTE_MARKER.search(question)
-    if not m:
-        return question, None
-    head, note = question[: m.start()], question[m.start():]
-    if _INJECTION_SIGNAL.search(note):
-        cleaned = head.rstrip().rstrip(",.;-") + " [note ignored as untrusted data]"
-        return cleaned, note
-    return question, None
+    q = question
+    changed = []
+    # 1) Strip a trailing contact clause (phone/email noise).
+    cm = _CONTACT_CLAUSE.search(q)
+    if cm:
+        q = q[: cm.start()].rstrip().rstrip(",.;:!?-")
+        changed.append("contact")
+    # 2) Neutralize an injected directive that follows a note marker.
+    nm = _NOTE_MARKER.search(q)
+    if nm and _INJECTION_SIGNAL.search(q[nm.start():]):
+        q = q[: nm.start()].rstrip().rstrip(",.;-") + " [note ignored as untrusted data]"
+        changed.append("note")
+    return q, (",".join(changed) if changed else None)
 
 
 # --- Cache helpers (the run is concurrent: guard shared state) -----------------------------
@@ -136,8 +153,8 @@ def mitigate(call_next, question, config, context):
     except Exception:
         pass
 
-    # 1) Sanitize injected order notes before the model ever sees them.
-    clean_q, removed_note = sanitize_question(question)
+    # 1) Sanitize the question (strip contact PII / injected notes) before the model sees it.
+    clean_q, sanitized = sanitize_question(question)
 
     # 2) Cache: serve repeats (latency + cost win). Only "ok" answers are cached.
     key = _cache_key(clean_q)
@@ -151,15 +168,22 @@ def mitigate(call_next, question, config, context):
     if _SYSTEM_PROMPT:
         conf["system_prompt"] = _SYSTEM_PROMPT
 
-    # 4) Retry with backoff on transient tool/agent errors.
+    # 4) Retry with backoff on transient tool/agent errors. If the agent loops or hits
+    #    max_steps, re-attempt with a decisiveness directive to break the loop.
+    base_prompt = conf.get("system_prompt", "")
+    loop_breaker = ("\n\nBe decisive: call each required tool EXACTLY ONCE, then immediately "
+                    "output the final result line. Never repeat a tool call.")
     attempts = 0
     max_attempts = 3
     backoff_ms = 200
     t0 = time.time()
     result = None
     last_exc = None
+    prev_loopish = False
     while attempts < max_attempts:
         attempts += 1
+        if attempts > 1 and prev_loopish and base_prompt:
+            conf["system_prompt"] = base_prompt + loop_breaker
         try:
             result = call_next(clean_q, conf)
         except Exception as exc:  # the agent raised — count it, back off, retry
@@ -167,6 +191,7 @@ def mitigate(call_next, question, config, context):
             result = None
         if result is not None and not _is_error_result(result):
             break
+        prev_loopish = isinstance(result, dict) and result.get("status") in ("loop", "max_steps")
         if attempts < max_attempts:
             time.sleep((backoff_ms * attempts) / 1000.0)
 
@@ -204,7 +229,7 @@ def mitigate(call_next, question, config, context):
         "tools_used": meta.get("tools_used", []),
         "n_tools": len(meta.get("tools_used", []) or []),
         "pii_in_answer": pii_hits,
-        "note_injection_stripped": bool(removed_note),
+        "sanitized": sanitized,
     })
 
     # 7) Cache only clean, successful results.
