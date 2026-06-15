@@ -15,3 +15,6 @@ score.json
 dashboard_summary.json
 .env
 .DS_Store
+observation-sim/
+README.txt
+.idea/
